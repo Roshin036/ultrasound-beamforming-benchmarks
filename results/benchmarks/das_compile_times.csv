@@ -1,0 +1,5 @@
+target,clean_build_wall_seconds,build_type,notes
+das_cpu_naive,9.431,Release,"includes VS environment, CMake/NMake, compile, and link"
+das_cpu_template,7.304,Release,"includes VS environment, CMake/NMake, compile, and link"
+das_cuda_naive,14.491,Release,"includes VS environment, CMake/NMake, compile, and link"
+das_cuda_template,14.402,Release,"includes VS environment, CMake/NMake, compile, and link"

@@ -1,0 +1,5 @@
+variant,timer,scope,warmups,runs,pixels,mean_ms,median_ms,p95_ms,min_ms,max_ms,binary_bytes,device_payload_bytes,device_free_delta_bytes,device_total_bytes
+cpu_naive,steady_clock,CPU compute loop only,2,30,24448,2984.56,2893.47,3757.42,1301.31,4372.36,50176,0,0,0
+cpu_template,steady_clock,CPU compute loop only,2,30,24448,1183.25,745.472,2908.93,677.586,3476.9,50176,0,0,0
+cuda_naive,cuda_event,GPU kernel only (excludes transfers),2,30,24448,18.9546,18.8641,19.5471,18.1709,20.0284,90112,46913620,50331648,6441926656
+cuda_template,cuda_event,GPU kernel only (excludes transfers),2,30,24448,19.1217,19.0566,19.7448,18.2723,20.0991,83456,46913620,50331648,6441926656
