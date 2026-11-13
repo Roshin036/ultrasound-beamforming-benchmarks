@@ -1,0 +1,23 @@
+# Large datasets
+*.hdf5
+*.h5
+
+# Build directories
+build/
+cmake-build-*/
+
+# Compiled files
+*.exe
+*.obj
+*.o
+*.dll
+*.lib
+*.pdb
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
