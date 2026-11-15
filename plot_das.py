@@ -17,9 +17,9 @@ def analytic_envelope(rf: np.ndarray) -> np.ndarray:
     multiplier[0] = 1.0
     if n % 2 == 0:
         multiplier[n // 2] = 1.0
-        multiplier[1:n // 2] = 2.0
+        multiplier[1 : n // 2] = 2.0
     else:
-        multiplier[1:(n + 1) // 2] = 2.0
+        multiplier[1 : (n + 1) // 2] = 2.0
     return np.abs(np.fft.ifft(spectrum * multiplier[:, None], axis=0))
 
 
@@ -31,11 +31,15 @@ def main() -> None:
 
     with args.input.open(newline="") as f:
         rows = list(csv.DictReader(f))
-    x_values = np.array(sorted({float(row["x_mm"]) for row in rows}))
-    z_values = np.array(sorted({float(row["z_mm"]) for row in rows}))
+
+    x_all = np.array([float(row["x_mm"]) for row in rows])
+    z_all = np.array([float(row["z_mm"]) for row in rows])
+    x_values = np.unique(np.round(x_all, 4))
+    z_values = np.unique(np.round(z_all, 4))
     expected = len(x_values) * len(z_values)
     if len(rows) != expected:
-        raise ValueError("CSV is not a complete rectangular x-z grid")
+        raise ValueError(f"CSV has {len(rows)} rows, expected {expected} ({len(x_values)} x {len(z_values)})")
+
     rf = np.array([float(row["rf_sum"]) for row in rows]).reshape(len(z_values), len(x_values))
     envelope = analytic_envelope(rf)
     peak = float(envelope.max())

@@ -13,6 +13,17 @@ cmake-build-*/
 *.dll
 *.lib
 *.pdb
+/cpu_naive_*
+/cpu_template_*
+/cuda_naive_*
+/cuda_template_*
+/cuda_device_check
+/das_cpu_*
+/das_cuda_*
+/cpu_naive
+/cpu_template
+/cuda_naive
+/cuda_template
 
 # Python cache
 __pycache__/

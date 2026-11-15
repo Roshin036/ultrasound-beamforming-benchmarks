@@ -1,4 +1,4 @@
-"""Export the selected zea/Open-H-RF track to the small DASREF01 binary format."""
+"""Export the zea/Open-H-RF dataset to the DASREF02 binary format."""
 
 from __future__ import annotations
 
@@ -11,14 +11,16 @@ import hdf5plugin  # noqa: F401 -- registers the Blosc filter used by these file
 import numpy as np
 
 
-MAGIC = b"DASREF01"
-HEADER = struct.Struct("<8sIIIdd")
+MAGIC = b"DASREF02"
+HEADER = struct.Struct("<8sIIIddddd")  # magic, n_tx, n_samples, n_rx, fs, sound_speed, fc, t_peak, f_num
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset", type=Path, help="Input zea HDF5 dataset")
-    parser.add_argument("output", type=Path, help="Output DASREF01 bundle")
+    parser.add_argument("output", type=Path, help="Output DASREF02 bundle")
+    parser.add_argument("--fnum", type=float, default=1.75, help="Receive f-number for dynamic aperture (default: 1.75)")
+    parser.add_argument("--tpeak", type=float, default=None, help="Pulse peak time offset in seconds (default: 1/fc)")
     args = parser.parse_args()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -37,6 +39,16 @@ def main() -> None:
         fs = float(scan["sampling_frequency"][()])
         sound_speed = float(scan["sound_speed"][()])
 
+        if "demodulation_frequency" in scan:
+            fc = float(scan["demodulation_frequency"][()])
+        elif "center_frequency" in scan:
+            fc = float(scan["center_frequency"][()])
+        else:
+            fc = 6.0e6
+
+        t_peak = float(1.0 / fc) if args.tpeak is None else float(args.tpeak)
+        f_num = float(args.fnum)
+
         if geometry.shape != (n_rx, 3):
             raise ValueError(f"Probe geometry {geometry.shape} does not match {n_rx} receive channels")
         if initial_times.shape != (n_tx,) or t0_delays.shape != (n_tx, n_rx):
@@ -47,13 +59,13 @@ def main() -> None:
             raise ValueError("Geometry and transmit delays must be finite")
 
         with args.output.open("wb") as out:
-            out.write(HEADER.pack(MAGIC, n_tx, n_samples, n_rx, fs, sound_speed))
+            out.write(HEADER.pack(MAGIC, n_tx, n_samples, n_rx, fs, sound_speed, fc, t_peak, f_num))
             for arr in (geometry, initial_times, t0_delays, tx_apodizations):
                 np.ascontiguousarray(arr).tofile(out)
             # Keep the HDF5 ordering: transmit, axial sample, receive element.
             np.asarray(raw_ds[0, :, :, :, 0], dtype="<f4").tofile(out)
 
-    print(f"Wrote {args.output} ({n_tx} tx x {n_samples} samples x {n_rx} rx)")
+    print(f"Wrote {args.output} ({n_tx} tx x {n_samples} samples x {n_rx} rx, fc={fc/1e6:.1f}MHz, t_peak={t_peak:.4e}s, f_num={f_num})")
 
 
 if __name__ == "__main__":
