@@ -24,6 +24,23 @@ cmake-build-*/
 /cpu_template
 /cuda_naive
 /cuda_template
+/dmas_cpu_naive
+/dmas_cpu_naive_O1
+/dmas_cpu_naive_O2
+/dmas_cpu_naive_O3
+/dmas_cpu_template
+/dmas_cpu_template_O1
+/dmas_cpu_template_O2
+/dmas_cpu_template_O3
+/dmas_cuda_naive
+/dmas_cuda_naive_O1
+/dmas_cuda_naive_O2
+/dmas_cuda_naive_O3
+/dmas_cuda_template
+/dmas_cuda_template_O1
+/dmas_cuda_template_O2
+/dmas_cuda_template_O3
+/dmas_cuda_optimized
 
 # Python cache
 __pycache__/

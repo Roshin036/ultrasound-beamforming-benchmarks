@@ -1,0 +1,13 @@
+algorithm,target,optimization,dataset,precision,compile_time_s,mean_ms,median_ms,p95_ms,min_ms,max_ms
+DMAS,dmas_cpu_naive,-O1,hypoechoic,float32,3.652777910232544,19619.3,19370.4,21210.3,18359.5,21785.9
+DMAS,dmas_cpu_naive,-O1,hyperechoic,float32,3.652777910232544,18628.8,18477.7,18828.6,18114.6,20496.0
+DMAS,dmas_cpu_naive,-O2,hypoechoic,float32,2.210096597671509,18339.2,18543.4,18786.0,17324.7,18817.3
+DMAS,dmas_cpu_naive,-O2,hyperechoic,float32,2.210096597671509,16605.0,16632.3,17015.4,16215.7,17605.9
+DMAS,dmas_cpu_naive,-O3,hypoechoic,float32,2.302626132965088,15936.0,15955.3,16639.0,15475.2,16725.6
+DMAS,dmas_cpu_naive,-O3,hyperechoic,float32,2.302626132965088,15330.7,15306.9,15456.3,15192.3,15599.0
+DMAS,dmas_cpu_template,-O1,hypoechoic,float32,1.667024850845337,15549.5,15544.8,15685.3,15361.5,15806.4
+DMAS,dmas_cpu_template,-O1,hyperechoic,float32,1.667024850845337,15588.1,15609.8,15720.2,15309.2,15754.4
+DMAS,dmas_cpu_template,-O2,hypoechoic,float32,1.8774821758270264,15453.3,15479.9,15614.9,15189.9,15764.0
+DMAS,dmas_cpu_template,-O2,hyperechoic,float32,1.8774821758270264,15358.0,15396.5,15449.6,15210.7,15481.9
+DMAS,dmas_cpu_template,-O3,hypoechoic,float32,1.8335955142974854,15411.2,15407.8,15576.0,15179.0,15879.3
+DMAS,dmas_cpu_template,-O3,hyperechoic,float32,1.8335955142974854,15321.9,15320.7,15422.8,15160.7,15529.9
