@@ -1,0 +1,45 @@
+\frametitle{Optimization 5: GPU Constant Memory Broadcast}
+\begin{columns}[T]
+    \begin{column}{0.48\textwidth}
+      \textbf{\small The Bottleneck:}
+      \scriptsize
+      \begin{itemize}
+        \item In CUDA, reading transducer element positions and steering delays from Global Memory (DRAM) incurs \textbf{$200-400$ cycles of latency}.
+        \item 304,200 threads competing for L1/L2 cache lines causes cache thrashing.
+      \end{itemize}
+      \textbf{\small The Constant Cache Architecture:}
+      \scriptsize
+      \begin{itemize}
+        \item Transducer coordinates and steering delays are invariant across all 304,200 threads.
+        \item NVIDIA GPUs feature a dedicated \textbf{64 KB Constant Memory Cache (\texttt{\_\_constant\_\_})}.
+        \item Single-cycle warp broadcast when all 32 threads read the same constant address!
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.52\textwidth}
+\begin{lstlisting}[caption={Constant Cache Broadcast Kernel}]
+// Stored in 64 KB dedicated Constant Memory:
+__constant__ float c_geom_x[128];
+__constant__ float c_t0_delays[21 * 128];
+
+// Inside GPU Kernel:
+for (int rx = rx_min; rx <= rx_max; ++rx) {
+  // Single-cycle broadcast to all 32 threads in the warp:
+  const float ex = x - c_geom_x[rx];
+  const float rx_time = sqrtf(ex * ex + z2) * inv_c;
+
+  #pragma unroll
+  for (int tx = 0; tx < 21; ++tx) {
+    const float t_tx = c_t0_delays[tx * 128 + rx];
+    sum += interp_fast(raw, tx, rx, (t_tx + rx_time) * fs);
+  }
+}
+\end{lstlisting}
+      \begin{block}{Impact}
+        \scriptsize
+        \begin{itemize}
+          \item DRAM latency drops from $400$ cycles to \textbf{1 cycle}.
+          \item Frees L1/L2 cache entirely for raw RF data streaming.
+        \end{itemize}
+      \end{block}
+    \end{column}
+  \end{columns}

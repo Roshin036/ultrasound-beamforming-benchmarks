@@ -31,11 +31,15 @@ def analytic_envelope(rf: np.ndarray) -> np.ndarray:
         multiplier[1 : (n + 1) // 2] = 2.0
     return np.abs(np.fft.ifft(spectrum * multiplier[:, None], axis=0))
 
-def load_bmode(csv_path: Path, nx=507, nz=600):
+def load_bmode(csv_path: Path, nx=507, nz=600, apply_bandpass: bool = False):
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
         rf_flat = np.array([float(r["rf_sum"]) for r in reader], dtype=np.float32)
     rf_2d = rf_flat.reshape(nz, nx)
+    if apply_bandpass:
+        import scipy.signal as signal
+        b, a = signal.butter(4, [0.08, 0.75], btype="bandpass")
+        rf_2d = signal.filtfilt(b, a, rf_2d, axis=0)
     env = analytic_envelope(rf_2d)
     peak = float(env.max())
     db = 20.0 * np.log10(np.maximum(env / peak, 1e-6))
@@ -55,8 +59,8 @@ def main():
     z_coords = np.linspace(zmin, zmax, nz)
     X, Z = np.meshgrid(x_coords, z_coords)
 
-    das_env, das_db = load_bmode(DAS_CSV, nx, nz)
-    dmas_env, dmas_db = load_bmode(DMAS_CSV, nx, nz)
+    das_env, das_db = load_bmode(DAS_CSV, nx, nz, apply_bandpass=False)
+    dmas_env, dmas_db = load_bmode(DMAS_CSV, nx, nz, apply_bandpass=True)
 
     # Define ROIs for hypoechoic cyst
     cyst_x, cyst_z = -8.4, 40.0
@@ -99,9 +103,9 @@ def main():
     axes[0].axhline(cyst_z, color="red", linestyle="--", alpha=0.5, label=f"Profile (z={cyst_z} mm)")
     axes[0].legend(loc="lower left", fontsize=8)
 
-    # Panel 2: DMAS
+    # Panel 2: Filtered DMAS
     im1 = axes[1].imshow(dmas_db, extent=[xmin, xmax, zmax, zmin], cmap="gray", vmin=-60, vmax=0, aspect="auto")
-    axes[1].set_title(f"DMAS (Delay Multiply and Sum)\nCR = {dmas_cr:.1f} dB · CNR = {dmas_cnr:.2f}", fontsize=11, fontweight="bold")
+    axes[1].set_title(f"Filtered DMAS (F-DMAS)\nCR = {dmas_cr:.1f} dB · CNR = {dmas_cnr:.2f}", fontsize=11, fontweight="bold")
     axes[1].set_xlabel("Lateral position x (mm)")
     axes[1].set_ylabel("Depth z (mm)")
     circle_cyst2 = plt.Circle((cyst_x, cyst_z), 3.5, color="cyan", fill=False, linewidth=1.5, linestyle="--")
@@ -120,8 +124,8 @@ def main():
     das_profile = das_db[iz_target, :]
     dmas_profile = dmas_db[iz_target, :]
 
-    axes[2].plot(x_coords, das_profile, label="DAS", color="tab:blue", linewidth=1.8)
-    axes[2].plot(x_coords, dmas_profile, label="DMAS", color="tab:orange", linewidth=1.8)
+    axes[2].plot(x_coords, das_profile, label="Standard DAS", color="tab:blue", linewidth=1.8)
+    axes[2].plot(x_coords, dmas_profile, label="Filtered DMAS (F-DMAS)", color="tab:orange", linewidth=1.8)
     axes[2].axvspan(cyst_x - 3.5, cyst_x + 3.5, color="cyan", alpha=0.15, label="Cyst Region")
     axes[2].set_xlim([xmin, xmax])
     axes[2].set_ylim([-60, 0])

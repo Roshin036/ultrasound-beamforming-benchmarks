@@ -1,0 +1,7 @@
+algorithm,target,optimization,dataset,precision,median_ms,mean_ms,min_ms,max_ms
+DAS,cpu_template,-O1,hypoechoic,float32,1890.54,1915.48,1856.54,1980.42
+DAS,cpu_template,-O2,hypoechoic,float32,1710.15,1737.29,1637.12,1893.48
+DAS,cpu_template,-O3,hypoechoic,float32,1784.21,1772.26,1713.59,1821.37
+DMAS,dmas_cpu_template,-O1,hypoechoic,float32,2447.31,2434.95,2327.42,2578.99
+DMAS,dmas_cpu_template,-O2,hypoechoic,float32,2922.79,2890.98,2728.12,2998.9
+DMAS,dmas_cpu_template,-O3,hypoechoic,float32,2218.16,2200.11,2103.35,2304.51

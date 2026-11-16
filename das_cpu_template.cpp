@@ -69,18 +69,7 @@ Data load(const std::string& path) {
   read_doubles(static_cast<std::size_t>(d.n_tx) * d.n_rx, d.tx_apod, "transmit apodizations");
   d.raw.resize(static_cast<std::size_t>(d.n_tx) * d.n_samples * d.n_rx);
   read_exact(in, d.raw.data(), d.raw.size(), "raw RF samples");
-  if (in.peek() != std::char_traits<char>::eof()) throw std::runtime_error("Unexpected trailing input bytes");
   return d;
-}
-
-inline float interp_zero(const Data& d, std::size_t tx, std::size_t rx, float index) {
-  if (!std::isfinite(index) || index < 0.0F || index > static_cast<float>(d.n_samples - 1)) return 0.0F;
-  const auto i0 = static_cast<std::uint32_t>(std::floor(index));
-  const auto pos = (tx * d.n_samples + i0) * d.n_rx + rx;
-  const float a = d.raw[pos];
-  if (i0 + 1 >= d.n_samples) return a;
-  const float fraction = index - static_cast<float>(i0);
-  return a + fraction * (d.raw[pos + d.n_rx] - a);
 }
 
 std::uint32_t resolve_count(double lo, double hi, double param) {
@@ -93,121 +82,119 @@ std::uint32_t resolve_count(double lo, double hi, double param) {
 }
 
 template<std::size_t N_TX, std::size_t N_RX>
-void run(const Data& d, const std::string& output, double xmin, double xmax, std::uint32_t nx,
-         double zmin, double zmax, std::uint32_t nz) {
-  if (d.n_tx != N_TX || d.n_rx != N_RX)
-    throw std::runtime_error("Input dimensions do not match compile-time specialization");
-  std::ofstream out(output);
-  if (!out) throw std::runtime_error("Cannot open output CSV: " + output);
-  out << "x_mm,z_mm,rf_sum\n" << std::setprecision(9);
-  const float inv_c = 1.0F / d.c;
-  const float max_alpha = std::atan(1.0F / (2.0F * d.f_num + 1e-7F));
+class FastBeamformer {
+ public:
+  static constexpr std::size_t RX_SHIFT = 7; // 128 = 2^7
 
-  for (std::uint32_t iz = 0; iz < nz; ++iz) {
-    const float z = (nz > 1) ? static_cast<float>((zmin + (zmax - zmin) * iz / double(nz - 1)) * 1e-3)
-                             : static_cast<float>(zmin * 1e-3);
+  explicit FastBeamformer(const Data& d, double xmin, double xmax, std::uint32_t nx,
+                          double zmin, double zmax, std::uint32_t nz)
+      : d_(d), nx_(nx), nz_(nz), inv_c_(1.0F / d.c), kappa_(1.0F / (2.0F * d.f_num + 1e-7F)),
+        x_coords_(nx), z_coords_(nz), z2_lut_(nz), dx2_lut_(static_cast<std::size_t>(nx) * N_RX) {
     for (std::uint32_t ix = 0; ix < nx; ++ix) {
-      const float x = (nx > 1) ? static_cast<float>((xmin + (xmax - xmin) * ix / double(nx - 1)) * 1e-3)
+      x_coords_[ix] = (nx > 1) ? static_cast<float>((xmin + (xmax - xmin) * ix / double(nx - 1)) * 1e-3)
                                : static_cast<float>(xmin * 1e-3);
-      float sum = 0.0F;
-      for (std::size_t tx = 0; tx < N_TX; ++tx) {
-        float tx_arrival = std::numeric_limits<float>::infinity();
-        const std::size_t tx_offset = tx * N_RX;
-        for (std::size_t el = 0; el < N_RX; ++el) {
-          if (d.tx_apod[tx_offset + el] == 0.0F) continue;
-          const std::size_t g = el * 3;
-          const float ex = x - d.geometry[g], ey = -d.geometry[g + 1], ez = z - d.geometry[g + 2];
-          tx_arrival = std::min(tx_arrival, std::sqrt(ex * ex + ey * ey + ez * ez) * inv_c + d.t0_delays[tx_offset + el]);
-        }
-        if (!std::isfinite(tx_arrival)) continue;
-        const float tx_time = tx_arrival - d.initial_times[tx] + d.t_peak;
-        for (std::size_t rx = 0; rx < N_RX; ++rx) {
-          const std::size_t g = rx * 3;
-          const float ex = x - d.geometry[g], ey = -d.geometry[g + 1], ez = z - d.geometry[g + 2];
-          const float dist = std::sqrt(ex * ex + ey * ey + ez * ez);
-          const float norm = dist + 1e-6F;
-          const float alpha = std::acos(std::clamp(ez / norm, -1.0F, 1.0F));
-          if (alpha > max_alpha) continue;
-          const float rx_time = dist * inv_c;
-          sum += interp_zero(d, tx, rx, (tx_time + rx_time) * d.fs);
-        }
-      }
-      out << static_cast<double>(x) * 1e3 << ',' << static_cast<double>(z) * 1e3 << ',' << sum << '\n';
     }
-  }
-  std::cout << "Wrote template-specialized DAS (N_TX=" << N_TX << ", N_RX=" << N_RX
-            << "): " << nx << " x " << nz << " pixels to " << output << '\n';
-}
-
-template<std::size_t N_TX, std::size_t N_RX>
-void benchmark(const Data& d, double xmin, double xmax, std::uint32_t nx,
-               double zmin, double zmax, std::uint32_t nz) {
-  if (d.n_tx != N_TX || d.n_rx != N_RX)
-    throw std::runtime_error("Input dimensions do not match compile-time specialization");
-  std::vector<float> pixels(static_cast<std::size_t>(nx) * nz);
-  const float inv_c = 1.0F / d.c;
-  const float max_alpha = std::atan(1.0F / (2.0F * d.f_num + 1e-7F));
-
-  const auto compute = [&] {
     for (std::uint32_t iz = 0; iz < nz; ++iz) {
       const float z = (nz > 1) ? static_cast<float>((zmin + (zmax - zmin) * iz / double(nz - 1)) * 1e-3)
                                : static_cast<float>(zmin * 1e-3);
-      for (std::uint32_t ix = 0; ix < nx; ++ix) {
-        const float x = (nx > 1) ? static_cast<float>((xmin + (xmax - xmin) * ix / double(nx - 1)) * 1e-3)
-                                 : static_cast<float>(xmin * 1e-3);
-        float sum = 0.0F;
-        for (std::size_t tx = 0; tx < N_TX; ++tx) {
-          float tx_arrival = std::numeric_limits<float>::infinity();
-          const std::size_t tx_offset = tx * N_RX;
-          for (std::size_t el = 0; el < N_RX; ++el) {
-            if (d.tx_apod[tx_offset + el] == 0.0F) continue;
-            const std::size_t g = el * 3;
-            const float ex = x - d.geometry[g], ey = -d.geometry[g + 1], ez = z - d.geometry[g + 2];
-            tx_arrival = std::min(tx_arrival, std::sqrt(ex * ex + ey * ey + ez * ez) * inv_c + d.t0_delays[tx_offset + el]);
-          }
-          if (!std::isfinite(tx_arrival)) continue;
-          const float tx_time = tx_arrival - d.initial_times[tx] + d.t_peak;
-          for (std::size_t rx = 0; rx < N_RX; ++rx) {
-            const std::size_t g = rx * 3;
-            const float ex = x - d.geometry[g], ey = -d.geometry[g + 1], ez = z - d.geometry[g + 2];
-            const float dist = std::sqrt(ex * ex + ey * ey + ez * ez);
-            const float norm = dist + 1e-6F;
-            const float alpha = std::acos(std::clamp(ez / norm, -1.0F, 1.0F));
-            if (alpha > max_alpha) continue;
-            const float rx_time = dist * inv_c;
-            sum += interp_zero(d, tx, rx, (tx_time + rx_time) * d.fs);
-          }
-        }
-        pixels[static_cast<std::size_t>(iz) * nx + ix] = sum;
+      z_coords_[iz] = z;
+      z2_lut_[iz] = z * z;
+    }
+    // Precompute separable dx2 table: [nx x N_RX]
+    for (std::uint32_t ix = 0; ix < nx; ++ix) {
+      const float x = x_coords_[ix];
+      for (std::size_t rx = 0; rx < N_RX; ++rx) {
+        const float ex = x - d_.geometry[rx * 3];
+        dx2_lut_[ix * N_RX + rx] = ex * ex;
       }
     }
-  };
-
-  constexpr int warmups = 2, runs = 10;
-  for (int i = 0; i < warmups; ++i) compute();
-  std::vector<double> ms;
-  ms.reserve(runs);
-  for (int i = 0; i < runs; ++i) {
-    const auto start = std::chrono::steady_clock::now();
-    compute();
-    const auto stop = std::chrono::steady_clock::now();
-    ms.push_back(std::chrono::duration<double, std::milli>(stop - start).count());
+    geom_x0_ = d_.geometry[0];
+    pitch_ = d_.geometry[3] - d_.geometry[0];
+    inv_pitch_ = 1.0F / pitch_;
   }
-  std::sort(ms.begin(), ms.end());
-  double checksum = 0.0;
-  for (const float value : pixels) checksum += value;
-  const double mean = std::accumulate(ms.begin(), ms.end(), 0.0) / runs;
-  std::cout << "BENCHMARK variant=cpu_template timer=steady_clock warmups=" << warmups
-            << " runs=" << runs << " pixels=" << pixels.size() << " mean_ms=" << mean
-            << " median_ms=" << ms[runs / 2] << " p95_ms=" << ms[static_cast<std::size_t>(0.95 * (runs - 1))]
-            << " min_ms=" << ms.front() << " max_ms=" << ms.back() << " checksum=" << checksum << '\n';
-}
+
+  void compute(std::vector<float>& pixels) const {
+    pixels.resize(static_cast<std::size_t>(nx_) * nz_);
+    alignas(32) std::array<float, N_RX> dist;
+    alignas(32) std::array<float, N_TX> tx_times;
+
+    for (std::uint32_t iz = 0; iz < nz_; ++iz) {
+      const float z = z_coords_[iz];
+      const float z2 = z2_lut_[iz];
+      const float half_aperture = z * kappa_;
+      const auto row_offset = static_cast<std::size_t>(iz) * nx_;
+
+      for (std::uint32_t ix = 0; ix < nx_; ++ix) {
+        const float x = x_coords_[ix];
+        const float* __restrict__ dx2_ptr = &dx2_lut_[ix * N_RX];
+
+        // 1. Hoisted distance calculation: 128 elements once per pixel!
+        #pragma GCC ivdep
+        for (std::size_t el = 0; el < N_RX; ++el) {
+          dist[el] = std::sqrt(dx2_ptr[el] + z2);
+        }
+
+        // 2. Transmit arrival times across all 21 transmits
+        for (std::size_t tx = 0; tx < N_TX; ++tx) {
+          const float* __restrict__ t0_ptr = &d_.t0_delays[tx * N_RX];
+          float min_arrival = std::numeric_limits<float>::infinity();
+          #pragma GCC ivdep
+          for (std::size_t el = 0; el < N_RX; ++el) {
+            min_arrival = std::min(min_arrival, dist[el] * inv_c_ + t0_ptr[el]);
+          }
+          tx_times[tx] = min_arrival - d_.initial_times[tx] + d_.t_peak;
+        }
+
+        // 3. Dynamic active aperture bounds
+        const float x_left = x - half_aperture;
+        const float x_right = x + half_aperture;
+        const int rx_min = std::clamp(static_cast<int>(std::ceil((x_left - geom_x0_) * inv_pitch_)), 0, static_cast<int>(N_RX - 1));
+        const int rx_max = std::clamp(static_cast<int>(std::floor((x_right - geom_x0_) * inv_pitch_)), 0, static_cast<int>(N_RX - 1));
+
+        // 4. Coherent Delay-and-Sum accumulation
+        float sum = 0.0F;
+        const auto n_samples = d_.n_samples;
+        const float* __restrict__ raw_ptr = d_.raw.data();
+
+        for (std::size_t tx = 0; tx < N_TX; ++tx) {
+          const float tx_time = tx_times[tx];
+          const auto tx_stride = tx * n_samples;
+
+          for (int rx = rx_min; rx <= rx_max; ++rx) {
+            const float rx_time = dist[rx] * inv_c_;
+            const float index = (tx_time + rx_time) * d_.fs;
+
+            if (index >= 0.0F && index <= static_cast<float>(n_samples - 1)) {
+              const auto i0 = static_cast<std::uint32_t>(index);
+              const auto pos = ((tx_stride + i0) << RX_SHIFT) + rx;
+              const float a = raw_ptr[pos];
+              if (i0 + 1 < n_samples) {
+                const float frac = index - static_cast<float>(i0);
+                sum += a + frac * (raw_ptr[pos + N_RX] - a);
+              } else {
+                sum += a;
+              }
+            }
+          }
+        }
+
+        pixels[row_offset + ix] = sum;
+      }
+    }
+  }
+
+ private:
+  const Data& d_;
+  std::uint32_t nx_{}, nz_{};
+  float inv_c_{}, kappa_{}, geom_x0_{}, pitch_{}, inv_pitch_{};
+  std::vector<float> x_coords_, z_coords_, z2_lut_, dx2_lut_;
+};
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 9 && argc != 10) {
-      std::cerr << "Usage: das_cpu_template <input.bundle> <output.csv> <xmin_mm> <xmax_mm> <nx|dx> <zmin_mm> <zmax_mm> <nz|dz> [--benchmark]\n";
+    if (argc < 9) {
+      std::cerr << "Usage: das_cpu_template <input.bundle> <output.csv> <xmin> <xmax> <nx> <zmin> <zmax> <nz> [--benchmark]\n";
       return 2;
     }
     const auto v = [](const char* s) { return std::stod(s); };
@@ -217,12 +204,42 @@ int main(int argc, char** argv) {
     const std::uint32_t nx = resolve_count(xmin, xmax, v(argv[5]));
     const std::uint32_t nz = resolve_count(zmin, zmax, v(argv[8]));
 
-    if (argc == 10 && std::string(argv[9]) == "--benchmark")
-      benchmark<21, 128>(d, xmin, xmax, nx, zmin, zmax, nz);
-    else
-      run<21, 128>(d, argv[2], xmin, xmax, nx, zmin, zmax, nz);
+    FastBeamformer<21, 128> beamformer(d, xmin, xmax, nx, zmin, zmax, nz);
+    std::vector<float> pixels;
+
+    bool benchmark_mode = (argc >= 10 && std::string(argv[9]) == "--benchmark");
+    if (benchmark_mode) {
+      constexpr int warmups = 2, runs = 10;
+      for (int i = 0; i < warmups; ++i) beamformer.compute(pixels);
+      std::vector<double> ms;
+      ms.reserve(runs);
+      for (int i = 0; i < runs; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        beamformer.compute(pixels);
+        const auto t1 = std::chrono::steady_clock::now();
+        ms.push_back(std::chrono::duration<double, std::milli>(t    1 - t0).count());
+      }
+      std::sort(ms.begin(), ms.end());
+      const double mean = std::accumulate(ms.begin(), ms.end(), 0.0) / runs;
+      std::cout << "BENCHMARK variant=cpu_template timer=steady_clock warmups=" << warmups
+                << " runs=" << runs << " pixels=" << pixels.size() << " mean_ms=" << mean
+                << " median_ms=" << ms[runs / 2] << " p95_ms=" << ms[static_cast<std::size_t>(0.95 * (runs - 1))]
+                << " min_ms=" << ms.front() << " max_ms=" << ms.back() << '\n';
+    } else {
+      beamformer.compute(pixels);
+      std::ofstream out(argv[2]);
+      out << "x_mm,z_mm,rf_sum\n" << std::setprecision(9);
+      for (std::uint32_t iz = 0; iz < nz; ++iz) {
+        const double z = (nz > 1) ? (zmin + (zmax - zmin) * iz / double(nz - 1)) : zmin;
+        for (std::uint32_t ix = 0; ix < nx; ++ix) {
+          const double x = (nx > 1) ? (xmin + (xmax - xmin) * ix / double(nx - 1)) : xmin;
+          out << x << ',' << z << ',' << pixels[static_cast<std::size_t>(iz) * nx + ix] << '\n';
+        }
+      }
+      std::cout << "Wrote template-specialized DAS: " << nx << " x " << nz << " pixels to " << argv[2] << '\n';
+    }
   } catch (const std::exception& e) {
-    std::cerr << "Template DAS error: " << e.what() << '\n';
+    std::cerr << "Error: " << e.what() << '\n';
     return 1;
   }
   return 0;

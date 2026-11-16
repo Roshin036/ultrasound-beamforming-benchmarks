@@ -1,0 +1,23 @@
+\frametitle{Step 1: specialize dimensions the project already knows}
+\begin{columns}[T,onlytextwidth]
+    \column{.47\textwidth}
+      \begin{beamercolorbox}[rounded=true,sep=.7em,wd=\linewidth]{block body}
+        \textcolor{Muted}{\bfseries Runtime-sized}\par\vspace{.3em}
+        \begin{lstlisting}
+for (tx = 0; tx < n_tx; ++tx)
+  for (rx = 0; rx < n_rx; ++rx)
+  ...
+        \end{lstlisting}
+        Bounds are ordinary runtime values.
+      \end{beamercolorbox}
+    \column{.47\textwidth}
+      \begin{beamercolorbox}[rounded=true,sep=.7em,wd=\linewidth]{block body}
+        \textcolor{Cyan}{\bfseries Compile-time specialization}\par\vspace{.3em}
+        \begin{lstlisting}
+template <int N_TX, int N_RX>
+...<21, 128>...
+        \end{lstlisting}
+        The compiler knows fixed loop bounds and can simplify/unroll code.
+      \end{beamercolorbox}
+  \end{columns}
+  \vspace{.3cm}\lay{This changes when loop sizes are known, not the beamforming equation; the specialized executable targets $N_{TX}=21$, $N_{RX}=128$.}

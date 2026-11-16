@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -58,13 +59,13 @@ Data load(const std::string& path) {
     d.f_num = 1.75;
   }
 
-  if (d.n_tx != K_TX || d.n_rx != K_RX)
-    throw std::runtime_error("Dimensions do not match compile-time specialization (K_TX=21, K_RX=128)");
+  if (!d.n_tx || !d.n_samples || !d.n_rx || !(d.fs > 0.0) || !(d.c > 0.0))
+    throw std::runtime_error("Invalid dimensions or acquisition constants");
 
-  d.geometry.resize(d.n_rx * 3);
+  d.geometry.resize(static_cast<std::size_t>(d.n_rx) * 3);
   d.initial_times.resize(d.n_tx);
-  d.t0_delays.resize(d.n_tx * d.n_rx);
-  d.tx_apod.resize(d.n_tx * d.n_rx);
+  d.t0_delays.resize(static_cast<std::size_t>(d.n_tx) * d.n_rx);
+  d.tx_apod.resize(static_cast<std::size_t>(d.n_tx) * d.n_rx);
   read_exact(in, d.geometry.data(), d.geometry.size(), "geometry");
   read_exact(in, d.initial_times.data(), d.initial_times.size(), "initial times");
   read_exact(in, d.t0_delays.data(), d.t0_delays.size(), "transmit delays");
@@ -112,180 +113,226 @@ class DeviceBuffer {
   T* ptr_{};
 };
 
+// Constant memory
+__constant__ float c_dmas_geom_x32[128];
+__constant__ float c_dmas_initial_times32[21];
+__constant__ float c_dmas_t0_delays32[21 * 128];
+
+__constant__ double c_dmas_geom_x64[128];
+__constant__ double c_dmas_initial_times64[21];
+__constant__ double c_dmas_t0_delays64[21 * 128];
+
 template <typename Real>
-__device__ inline Real interp_zero(const float* raw, std::uint32_t n_samples,
-                                   std::uint32_t tx, std::uint32_t rx, Real index) {
+struct DmasConstMemoryTraits;
+
+template <>
+struct DmasConstMemoryTraits<float> {
+  __device__ static inline float geom_x(std::size_t i) { return c_dmas_geom_x32[i]; }
+  __device__ static inline float initial_time(std::size_t i) { return c_dmas_initial_times32[i]; }
+  __device__ static inline float t0_delay(std::size_t i) { return c_dmas_t0_delays32[i]; }
+};
+
+template <>
+struct DmasConstMemoryTraits<double> {
+  __device__ static inline double geom_x(std::size_t i) { return c_dmas_geom_x64[i]; }
+  __device__ static inline double initial_time(std::size_t i) { return c_dmas_initial_times64[i]; }
+  __device__ static inline double t0_delay(std::size_t i) { return c_dmas_t0_delays64[i]; }
+};
+
+template <typename Real>
+__device__ inline Real interp_zero_fast(const float* __restrict__ raw, std::uint32_t n_samples,
+                                        std::size_t tx_stride, std::size_t rx, Real index) {
   if (!isfinite(index) || index < Real(0.0) || index > static_cast<Real>(n_samples - 1)) return Real(0.0);
   const auto i0 = static_cast<std::uint32_t>(floor(index));
-  const auto pos = (static_cast<std::size_t>(tx) * n_samples + i0) * K_RX + rx;
+  const auto pos = ((tx_stride + i0) << 7) + rx;
   const Real a = static_cast<Real>(raw[pos]);
   if (i0 + 1 >= n_samples) return a;
   const Real f = index - static_cast<Real>(i0);
-  return a + f * (static_cast<Real>(raw[pos + K_RX]) - a);
+  return a + f * (static_cast<Real>(raw[pos + 128]) - a);
 }
 
 template <typename Real, std::size_t N_TX, std::size_t N_RX>
-__global__ void dmas_template_kernel(const Real* geometry, const Real* initial_times,
-                                     const Real* t0_delays, const Real* tx_apod,
-                                     const float* raw, Real* output,
-                                     std::uint32_t n_samples, Real fs, Real c,
-                                     Real t_peak, Real f_num,
-                                     std::uint32_t nx, std::uint32_t nz,
-                                     double xmin_mm, double xmax_mm,
-                                     double zmin_mm, double zmax_mm) {
+__global__ void dmas_fast_template_kernel(const float* __restrict__ raw, Real* __restrict__ output,
+                                          std::uint32_t n_samples, Real fs, Real inv_c,
+                                          Real t_peak, Real kappa, Real geom_x0, Real inv_pitch,
+                                          std::uint32_t nx, std::uint32_t nz,
+                                          double xmin_mm, double xmax_mm,
+                                          double zmin_mm, double zmax_mm) {
   const std::uint32_t pixel = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t pixel_count = nx * nz;
   if (pixel >= pixel_count) return;
+
   const std::uint32_t iz = pixel / nx;
   const std::uint32_t ix = pixel - iz * nx;
   const Real x = (nx > 1) ? static_cast<Real>((xmin_mm + (xmax_mm - xmin_mm) * ix / double(nx - 1)) * 1e-3)
                           : static_cast<Real>(xmin_mm * 1e-3);
   const Real z = (nz > 1) ? static_cast<Real>((zmin_mm + (zmax_mm - zmin_mm) * iz / double(nz - 1)) * 1e-3)
                           : static_cast<Real>(zmin_mm * 1e-3);
-  const Real inv_c = Real(1.0) / c;
-  const Real max_alpha = atan(Real(1.0) / (Real(2.0) * f_num + Real(1e-7)));
-  Real total_dmas = Real(0.0);
+  const Real z2 = z * z;
+
+  // 1. Transmit arrival times: 21 values computed once per pixel
+  Real tx_times[N_TX];
+  #pragma unroll
+  for (std::size_t tx = 0; tx < N_TX; ++tx) {
+    Real min_arr = Real(1e30);
+    const std::size_t tx_offset = tx * N_RX;
+    #pragma unroll 16
+    for (std::size_t el = 0; el < N_RX; ++el) {
+      const Real ex = x - DmasConstMemoryTraits<Real>::geom_x(el);
+      const Real dist = sqrt(ex * ex + z2);
+      const Real cand = dist * inv_c + DmasConstMemoryTraits<Real>::t0_delay(tx_offset + el);
+      min_arr = (cand < min_arr) ? cand : min_arr;
+    }
+    tx_times[tx] = min_arr - DmasConstMemoryTraits<Real>::initial_time(tx) + t_peak;
+  }
+
+  // 2. Analytical Dynamic Aperture bounds
+  const Real half_aperture = z * kappa;
+  const int rx_min = max(0, min(static_cast<int>(N_RX - 1), static_cast<int>(ceil((x - half_aperture - geom_x0) * inv_pitch))));
+  const int rx_max = max(0, min(static_cast<int>(N_RX - 1), static_cast<int>(floor((x + half_aperture - geom_x0) * inv_pitch))));
+
+  // 3. Filtered DMAS accumulation
+  Real dmas_pixel_sum = Real(0.0);
 
   for (std::size_t tx = 0; tx < N_TX; ++tx) {
-    Real tx_arrival = Real(1e30);
-    const std::size_t tx_offset = tx * N_RX;
-    for (std::size_t el = 0; el < N_RX; ++el) {
-      if (tx_apod[tx_offset + el] == Real(0.0)) continue;
-      const std::size_t g = el * 3;
-      const Real ex = x - geometry[g];
-      const Real ey = -geometry[g + 1];
-      const Real ez = z - geometry[g + 2];
-      const Real candidate = sqrt(ex * ex + ey * ey + ez * ez) * inv_c + t0_delays[tx_offset + el];
-      tx_arrival = (candidate < tx_arrival) ? candidate : tx_arrival;
-    }
-    if (tx_arrival >= Real(1e29)) continue;
-    const Real tx_time = tx_arrival - initial_times[tx] + t_peak;
+    const auto tx_stride = tx * n_samples;
+    const Real tx_time = tx_times[tx];
 
     Real s1 = Real(0.0);
     Real s2 = Real(0.0);
-    for (std::size_t rx = 0; rx < N_RX; ++rx) {
-      const std::size_t g = rx * 3;
-      const Real ex = x - geometry[g];
-      const Real ey = -geometry[g + 1];
-      const Real ez = z - geometry[g + 2];
-      const Real dist = sqrt(ex * ex + ey * ey + ez * ez);
-      const Real norm = dist + Real(1e-6);
-      const Real alpha = acos(fmin(fmax(ez / norm, Real(-1.0)), Real(1.0)));
-      if (alpha > max_alpha) continue;
+
+    for (int rx = rx_min; rx <= rx_max; ++rx) {
+      const Real ex = x - DmasConstMemoryTraits<Real>::geom_x(rx);
+      const Real dist = sqrt(ex * ex + z2);
       const Real rx_time = dist * inv_c;
-      const Real val = interp_zero(raw, n_samples, tx, rx, (tx_time + rx_time) * fs);
-      const Real s_hat = copysign(sqrt(fabs(val)), val);
+      const Real val = interp_zero_fast<Real>(raw, n_samples, tx_stride, rx, (tx_time + rx_time) * fs);
+
+      const Real s_hat = (val > Real(0.0)) ? sqrt(val) : ((val < Real(0.0)) ? -sqrt(-val) : Real(0.0));
       s1 += s_hat;
-      s2 += fabs(val);
+      s2 += abs(val);
     }
-    total_dmas += Real(0.5) * (s1 * s1 - s2);
+
+    dmas_pixel_sum += Real(0.5) * (s1 * s1 - s2);
   }
-  output[pixel] = total_dmas;
+
+  output[pixel] = dmas_pixel_sum;
 }
 
-template <typename Real>
-void execute_dmas_template(const Data& d, const std::string& output, double xmin, double xmax,
-                           std::uint32_t nx, double zmin, double zmax, std::uint32_t nz,
-                           bool benchmark_mode) {
+template <typename Real, std::size_t N_TX, std::size_t N_RX>
+void run_typed(const Data& d, const std::string& output_path,
+               double xmin, double xmax, std::uint32_t nx,
+               double zmin, double zmax, std::uint32_t nz,
+               bool benchmark_mode) {
+  if (d.n_tx != N_TX || d.n_rx != N_RX)
+    throw std::runtime_error("Input dimensions do not match template specialization");
+
   const std::size_t pixel_count = static_cast<std::size_t>(nx) * nz;
-  const auto cast_vec = [](const std::vector<double>& src) {
-    std::vector<Real> dst(src.size());
-    for (std::size_t i = 0; i < src.size(); ++i) dst[i] = static_cast<Real>(src[i]);
-    return dst;
-  };
 
-  const std::vector<Real> geom_h = cast_vec(d.geometry);
-  const std::vector<Real> init_h = cast_vec(d.initial_times);
-  const std::vector<Real> t0_h = cast_vec(d.t0_delays);
-  const std::vector<Real> apod_h = cast_vec(d.tx_apod);
+  std::size_t free_before{}, total_device_bytes{};
+  cuda_check(cudaMemGetInfo(&free_before, &total_device_bytes), "cudaMemGetInfo before");
 
-  DeviceBuffer<Real> geom_d(geom_h.size());
-  DeviceBuffer<Real> init_d(init_h.size());
-  DeviceBuffer<Real> t0_d(t0_h.size());
-  DeviceBuffer<Real> apod_d(apod_h.size());
-  DeviceBuffer<float> raw_d(d.raw.size());
-  DeviceBuffer<Real> out_d(pixel_count);
+  // Constant memory upload
+  if constexpr (std::is_same_v<Real, float>) {
+    std::vector<float> h_geom(N_RX), h_init(N_TX), h_delays(N_TX * N_RX);
+    for (std::size_t i = 0; i < N_RX; ++i) h_geom[i] = static_cast<float>(d.geometry[i * 3]);
+    for (std::size_t i = 0; i < N_TX; ++i) h_init[i] = static_cast<float>(d.initial_times[i]);
+    for (std::size_t i = 0; i < N_TX * N_RX; ++i) h_delays[i] = static_cast<float>(d.t0_delays[i]);
+    cuda_check(cudaMemcpyToSymbol(c_dmas_geom_x32, h_geom.data(), N_RX * sizeof(float)), "c_dmas_geom_x32");
+    cuda_check(cudaMemcpyToSymbol(c_dmas_initial_times32, h_init.data(), N_TX * sizeof(float)), "c_dmas_initial_times32");
+    cuda_check(cudaMemcpyToSymbol(c_dmas_t0_delays32, h_delays.data(), N_TX * N_RX * sizeof(float)), "c_dmas_t0_delays32");
+  } else {
+    std::vector<double> h_geom(N_RX), h_init(N_TX), h_delays(N_TX * N_RX);
+    for (std::size_t i = 0; i < N_RX; ++i) h_geom[i] = d.geometry[i * 3];
+    for (std::size_t i = 0; i < N_TX; ++i) h_init[i] = d.initial_times[i];
+    for (std::size_t i = 0; i < N_TX * N_RX; ++i) h_delays[i] = d.t0_delays[i];
+    cuda_check(cudaMemcpyToSymbol(c_dmas_geom_x64, h_geom.data(), N_RX * sizeof(double)), "c_dmas_geom_x64");
+    cuda_check(cudaMemcpyToSymbol(c_dmas_initial_times64, h_init.data(), N_TX * sizeof(double)), "c_dmas_initial_times64");
+    cuda_check(cudaMemcpyToSymbol(c_dmas_t0_delays64, h_delays.data(), N_TX * N_RX * sizeof(double)), "c_dmas_t0_delays64");
+  }
 
-  geom_d.upload(geom_h);
-  init_d.upload(init_h);
-  t0_d.upload(t0_h);
-  apod_d.upload(apod_h);
-  raw_d.upload(d.raw);
+  DeviceBuffer<float> d_raw(d.raw.size());
+  d_raw.upload(d.raw);
+  DeviceBuffer<Real> d_output(pixel_count);
 
-  const std::size_t allocated_bytes =
-      (geom_h.size() + init_h.size() + t0_h.size() + apod_h.size() + pixel_count) * sizeof(Real) +
-      d.raw.size() * sizeof(float);
+  std::size_t free_after{};
+  cuda_check(cudaMemGetInfo(&free_after, &total_device_bytes), "cudaMemGetInfo after");
+  const std::size_t device_buffer_bytes = free_before - free_after;
 
-  constexpr std::uint32_t kBlockSize = 256;
-  const std::uint32_t grid_size = (pixel_count + kBlockSize - 1) / kBlockSize;
+  const Real inv_c = Real(1.0) / static_cast<Real>(d.c);
+  const Real t_peak = static_cast<Real>(d.t_peak);
+  const Real kappa = Real(1.0) / (Real(2.0) * static_cast<Real>(d.f_num) + Real(1e-7));
+  const Real geom_x0 = static_cast<Real>(d.geometry[0]);
+  const Real pitch = static_cast<Real>(d.geometry[3] - d.geometry[0]);
+  const Real inv_pitch = Real(1.0) / pitch;
+  const Real fs = static_cast<Real>(d.fs);
 
-  const auto launch_kernel = [&]() {
-    dmas_template_kernel<Real, K_TX, K_RX><<<grid_size, kBlockSize>>>(
-        geom_d.get(), init_d.get(), t0_d.get(), apod_d.get(), raw_d.get(), out_d.get(),
-        d.n_samples, static_cast<Real>(d.fs), static_cast<Real>(d.c),
-        static_cast<Real>(d.t_peak), static_cast<Real>(d.f_num),
+  constexpr int threads = 256;
+  const auto blocks = static_cast<unsigned>((pixel_count + threads - 1) / threads);
+
+  const auto launch = [&] {
+    dmas_fast_template_kernel<Real, N_TX, N_RX><<<blocks, threads>>>(
+        d_raw.get(), d_output.get(),
+        d.n_samples, fs, inv_c, t_peak, kappa, geom_x0, inv_pitch,
         nx, nz, xmin, xmax, zmin, zmax);
-    cuda_check(cudaGetLastError(), "dmas_template_kernel execution");
+    cuda_check(cudaGetLastError(), "dmas_fast_template_kernel launch");
   };
 
-  if (!benchmark_mode) {
-    launch_kernel();
-    cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize run");
-    std::vector<Real> pixels(pixel_count);
-    out_d.download(pixels);
+  if (benchmark_mode) {
+    constexpr int warmups = 2, runs = 30;
+    for (int i = 0; i < warmups; ++i) launch();
+    cuda_check(cudaDeviceSynchronize(), "CUDA warmup sync");
 
-    std::ofstream out(output);
-    if (!out) throw std::runtime_error("Cannot open output CSV: " + output);
-    out << "x_mm,z_mm,rf_sum\n" << std::setprecision(9);
-    for (std::uint32_t iz = 0; iz < nz; ++iz) {
-      const double z = (nz > 1) ? (zmin + (zmax - zmin) * iz / double(nz - 1)) : zmin;
-      for (std::uint32_t ix = 0; ix < nx; ++ix) {
-        const double x = (nx > 1) ? (xmin + (xmax - xmin) * ix / double(nx - 1)) : xmin;
-        out << x << ',' << z << ',' << pixels[static_cast<std::size_t>(iz) * nx + ix] << '\n';
-      }
+    cudaEvent_t start{}, stop{};
+    cuda_check(cudaEventCreate(&start), "cudaEventCreate start");
+    cuda_check(cudaEventCreate(&stop), "cudaEventCreate stop");
+    std::vector<float> ms;
+    ms.reserve(runs);
+
+    for (int i = 0; i < runs; ++i) {
+      cuda_check(cudaEventRecord(start), "cudaEventRecord start");
+      launch();
+      cuda_check(cudaEventRecord(stop), "cudaEventRecord stop");
+      cuda_check(cudaEventSynchronize(stop), "cudaEventSynchronize");
+      float elapsed{};
+      cuda_check(cudaEventElapsedTime(&elapsed, start, stop), "cudaEventElapsedTime");
+      ms.push_back(elapsed);
     }
-    std::cout << "Wrote template CUDA DMAS (" << (sizeof(Real) == 8 ? "FP64" : "FP32")
-              << "): " << nx << " x " << nz << " pixels to " << output << '\n';
-    return;
+    cuda_check(cudaEventDestroy(start), "cudaEventDestroy start");
+    cuda_check(cudaEventDestroy(stop), "cudaEventDestroy stop");
+    std::sort(ms.begin(), ms.end());
+
+    double total = 0.0;
+    for (const float value : ms) total += value;
+    std::string prec_name = (sizeof(Real) == 8) ? "dmas_cuda_template_f64" : "dmas_cuda_template_f32";
+    std::cout << "BENCHMARK variant=" << prec_name << " timer=cuda_event warmups=" << warmups
+              << " runs=" << runs << " pixels=" << pixel_count << " mean_ms=" << total / runs
+              << " median_ms=" << ms[runs / 2] << " p95_ms=" << ms[static_cast<std::size_t>(0.95 * (runs - 1))]
+              << " min_ms=" << ms.front() << " max_ms=" << ms.back()
+              << " device_buffer_bytes=" << device_buffer_bytes
+              << " device_total_bytes=" << total_device_bytes << '\n';
+  } else {
+    launch();
   }
 
-  constexpr int warmups = 2, runs = 30;
-  for (int i = 0; i < warmups; ++i) {
-    launch_kernel();
-    cuda_check(cudaDeviceSynchronize(), "warmup sync");
+  cuda_check(cudaDeviceSynchronize(), "DMAS kernel execution");
+  std::vector<Real> pixels(pixel_count);
+  d_output.download(pixels);
+
+  std::ofstream out(output_path);
+  if (!out) throw std::runtime_error("Cannot open output CSV: " + output_path);
+  out << "x_mm,z_mm,rf_sum\n" << std::setprecision(9);
+  for (std::uint32_t iz = 0; iz < nz; ++iz) {
+    const double z = (nz > 1) ? (zmin + (zmax - zmin) * iz / double(nz - 1)) : zmin;
+    for (std::uint32_t ix = 0; ix < nx; ++ix) {
+      const double x = (nx > 1) ? (xmin + (xmax - xmin) * ix / double(nx - 1)) : xmin;
+      const std::size_t index = static_cast<std::size_t>(iz) * nx + ix;
+      out << x << ',' << z << ',' << pixels[index] << '\n';
+    }
   }
-
-  cudaEvent_t start{}, stop{};
-  cuda_check(cudaEventCreate(&start), "cudaEventCreate start");
-  cuda_check(cudaEventCreate(&stop), "cudaEventCreate stop");
-
-  std::vector<double> ms;
-  ms.reserve(runs);
-  for (int i = 0; i < runs; ++i) {
-    cuda_check(cudaEventRecord(start), "cudaEventRecord start");
-    launch_kernel();
-    cuda_check(cudaEventRecord(stop), "cudaEventRecord stop");
-    cuda_check(cudaEventSynchronize(stop), "cudaEventSynchronize stop");
-    float elapsed_ms{};
-    cuda_check(cudaEventElapsedTime(&elapsed_ms, start, stop), "cudaEventElapsedTime");
-    ms.push_back(elapsed_ms);
-  }
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
-
-  std::sort(ms.begin(), ms.end());
-  const double mean = std::accumulate(ms.begin(), ms.end(), 0.0) / runs;
-  cudaDeviceProp prop{};
-  cuda_check(cudaGetDeviceProperties(&prop, 0), "cudaGetDeviceProperties");
-
-  std::cout << "BENCHMARK variant=" << (sizeof(Real) == 8 ? "dmas_cuda_template_f64" : "dmas_cuda_template_f32")
-            << " timer=cuda_event warmups=" << warmups << " runs=" << runs
-            << " pixels=" << pixel_count << " mean_ms=" << mean
-            << " median_ms=" << ms[runs / 2] << " p95_ms=" << ms[static_cast<std::size_t>(0.95 * (runs - 1))]
-            << " min_ms=" << ms.front() << " max_ms=" << ms.back()
-            << " device_buffer_bytes=" << allocated_bytes
-            << " device_total_bytes=" << prop.totalGlobalMem << '\n';
+  std::cout << "Wrote template CUDA DMAS (" << (sizeof(Real) == 8 ? "FP64" : "FP32")
+            << "): " << nx << " x " << nz << " pixels to " << output_path << '\n';
 }
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -301,20 +348,24 @@ int main(int argc, char** argv) {
     const std::uint32_t nx = resolve_count(xmin, xmax, v(argv[5]));
     const std::uint32_t nz = resolve_count(zmin, zmax, v(argv[8]));
 
-    bool use_double = false;
     bool benchmark_mode = false;
+    bool double_precision = false;
+
     for (int i = 9; i < argc; ++i) {
       std::string arg = argv[i];
-      if (arg == "--double") use_double = true;
       if (arg == "--benchmark") benchmark_mode = true;
+      else if (arg == "--double" || arg == "--f64") double_precision = true;
+      else if (arg == "--float" || arg == "--f32") double_precision = false;
+      else throw std::runtime_error("Unknown option: " + arg);
     }
 
-    if (use_double)
-      execute_dmas_template<double>(d, argv[2], xmin, xmax, nx, zmin, zmax, nz, benchmark_mode);
-    else
-      execute_dmas_template<float>(d, argv[2], xmin, xmax, nx, zmin, zmax, nz, benchmark_mode);
-  } catch (const std::exception& e) {
-    std::cerr << "CUDA DMAS template error: " << e.what() << '\n';
+    if (double_precision) {
+      run_typed<double, K_TX, K_RX>(d, argv[2], xmin, xmax, nx, zmin, zmax, nz, benchmark_mode);
+    } else {
+      run_typed<float, K_TX, K_RX>(d, argv[2], xmin, xmax, nx, zmin, zmax, nz, benchmark_mode);
+    }
+  } catch (const std::exception& error) {
+    std::cerr << "CUDA template DMAS error: " << error.what() << '\n';
     return 1;
   }
   return 0;
